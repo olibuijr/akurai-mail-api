@@ -62,6 +62,7 @@ This builds the Rust binary, builds the SvelteKit frontend, uploads both to the 
 ### Admin (session cookie required)
 - `GET /api/status` — full server status
 - `GET /api/metrics` — lightweight CPU/memory/disk + processes
+- `GET /api/metrics/stream` — SSE stream for live status updates
 - `GET /api/dns` — DNS records
 - `GET /api/domain-list` — managed domains
 - `POST /api/actions` — admin operations (add-user, set-password, etc.)

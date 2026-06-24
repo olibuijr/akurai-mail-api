@@ -95,6 +95,7 @@ async fn main() {
     let admin_api = Router::new()
         .route("/api/status", get(routes::status))
         .route("/api/metrics", get(routes::metrics))
+        .route("/api/metrics/stream", get(routes::metrics_stream))
         .route("/api/dns", get(routes::dns))
         .route("/api/domain-list", get(routes::domain_list))
         .route("/api/actions", post(routes::actions))

@@ -2,13 +2,17 @@ use axum::{
     Json,
     extract::Query,
     http::{HeaderMap, HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{
+        IntoResponse, Redirect, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::auth;
 use crate::config;
@@ -166,6 +170,33 @@ pub async fn status() -> Response {
 
 pub async fn metrics() -> Response {
     native_result(native::metrics).await
+}
+
+pub async fn metrics_stream() -> impl IntoResponse {
+    let stream = async_stream::stream! {
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let event = match tokio::task::spawn_blocking(native::metrics).await {
+                Ok(Ok(value)) => {
+                    let data = serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string());
+                    Event::default().event("metrics").data(data)
+                }
+                Ok(Err(error)) => {
+                    Event::default().event("error").data(json!({ "ok": false, "error": error }).to_string())
+                }
+                Err(error) => {
+                    Event::default().event("error").data(json!({ "ok": false, "error": format!("task failed: {error}") }).to_string())
+                }
+            };
+            yield Ok::<Event, Infallible>(event);
+        }
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
+
+    (headers, Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
 pub async fn dns() -> Response {

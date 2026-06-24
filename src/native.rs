@@ -33,6 +33,42 @@ static STATUS_CACHE: LazyLock<Mutex<Option<(Instant, Value)>>> = LazyLock::new(|
 static DNS_CACHE: LazyLock<Mutex<Option<(Instant, Value)>>> = LazyLock::new(|| Mutex::new(None));
 static DOMAIN_LIST_CACHE: LazyLock<Mutex<Option<(Instant, Value)>>> =
     LazyLock::new(|| Mutex::new(None));
+static COMMAND_REDACTIONS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    vec![
+        (
+            Regex::new(r#"(?i)(cookie:\s*)[^\s"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(authorization:\s*bearer\s+)[^\s"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(akurai_session=)[^\s;"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(akurai_mailbox_session=)[^\s;"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(AKURAI_ADMIN_PASSWORD=)[^\s"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(password=)[^\s&;"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(token=)[^\s&;"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+        (
+            Regex::new(r#"(?i)(secret=)[^\s&;"']+"#).unwrap(),
+            "$1[redacted]",
+        ),
+    ]
+});
 
 fn cached(
     slot: &LazyLock<Mutex<Option<(Instant, Value)>>>,
@@ -492,28 +528,58 @@ fn delivery_errors() -> Value {
     Value::Array(rows)
 }
 
+fn sanitize_command(command: &str) -> String {
+    let mut out = command.to_string();
+    for (re, replacement) in COMMAND_REDACTIONS.iter() {
+        out = re.replace_all(&out, *replacement).into_owned();
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_command;
+
+    #[test]
+    fn command_redaction_hides_tokens_and_cookies() {
+        let command = "curl -H Cookie: akurai_session=abc123 Authorization: Bearer xyz password=hunter2 token=secret";
+        let sanitized = sanitize_command(command);
+
+        assert!(sanitized.contains("Cookie: [redacted]"));
+        assert!(sanitized.contains("Authorization: Bearer [redacted]"));
+        assert!(sanitized.contains("password=[redacted]"));
+        assert!(sanitized.contains("token=[redacted]"));
+        assert!(!sanitized.contains("abc123"));
+        assert!(!sanitized.contains("hunter2"));
+    }
+}
+
 fn top_processes() -> Value {
-    let text = command_output("ps", &["aux", "--sort=-pcpu"]);
+    let text = command_output(
+        "ps",
+        &["-eo", "pid=,user=,pcpu=,pmem=,rss=,args=", "--sort=-pcpu"],
+    );
     let rows: Vec<Value> = text
         .lines()
-        .skip(1)
         .take(15)
         .filter_map(|line| {
-            let parts: Vec<&str> = line
-                .splitn(11, char::is_whitespace)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if parts.len() < 11 {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse::<u32>().ok()?;
+            let user = parts.next()?;
+            let cpu = parts.next()?.parse::<f64>().unwrap_or(0.0);
+            let mem = parts.next()?.parse::<f64>().unwrap_or(0.0);
+            let rss = parts.next()?.parse::<u64>().unwrap_or(0);
+            let command = sanitize_command(&parts.collect::<Vec<_>>().join(" "));
+            if command.is_empty() {
                 return None;
             }
             Some(json!({
-                "pid": parts[1].parse::<u32>().unwrap_or(0),
-                "user": parts[0],
-                "cpu": parts[2].parse::<f64>().unwrap_or(0.0),
-                "mem": parts[3].parse::<f64>().unwrap_or(0.0),
-                "vsz": parts[4].parse::<u64>().unwrap_or(0),
-                "rss": parts[5].parse::<u64>().unwrap_or(0),
-                "command": parts[10].chars().take(120).collect::<String>(),
+                "pid": pid,
+                "user": user,
+                "cpu": cpu,
+                "mem": mem,
+                "rss": rss,
+                "command": command.chars().take(120).collect::<String>(),
             }))
         })
         .collect();
@@ -713,6 +779,7 @@ fn build_status() -> NativeResult<Value> {
     let mut data = load_json(STATE, state_default())?;
     data["services"] = services();
     data["metrics"] = vm_metrics(&mut data);
+    data["processes"] = top_processes();
     data["users"] = Value::Array(dovecot_users());
     data["aliases"] = aliases();
     data["queue"] = mail_queue();

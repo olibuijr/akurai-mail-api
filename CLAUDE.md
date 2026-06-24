@@ -48,7 +48,7 @@ nginx (TLS, gzip) → akurai-mail-api (:3000)
 
 **Public:** `POST /api/login`, `POST /api/webmail/login`, `GET /api/logout`, `GET /api/webmail/logout`, `GET /api/auth/check`
 
-**Admin (session cookie):** `GET /api/status`, `GET /api/metrics`, `GET /api/dns`, `GET /api/domain-list`, `POST /api/actions`
+**Admin (session cookie):** `GET /api/status`, `GET /api/metrics`, `GET /api/metrics/stream`, `GET /api/dns`, `GET /api/domain-list`, `POST /api/actions`
 
 **Webmail (admin or mailbox session):** `GET /api/webmail`, `POST /api/webmail`
 
