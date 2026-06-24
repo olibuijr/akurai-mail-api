@@ -12,8 +12,9 @@ step() { echo; echo "── $* ──"; }
 # Step 1: Build Rust binary (release)
 # ---------------------------------------------------------------------------
 step "1/5  Build Rust binary"
-cargo build --release 2>&1
-BINARY="target/release/akurai-mail-api"
+TARGET="x86_64-unknown-linux-musl"
+cargo build --release --target "$TARGET" 2>&1
+BINARY="target/$TARGET/release/akurai-mail-api"
 log "Binary: $(du -sh "$BINARY" | cut -f1)"
 
 # ---------------------------------------------------------------------------

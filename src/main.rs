@@ -12,7 +12,7 @@ use axum::{
 };
 use serde_json::json;
 use std::collections::HashMap;
-use tower_http::services::ServeDir;
+use tower_http::services::{ServeDir, ServeFile};
 
 fn parse_cookies(headers: &HeaderMap) -> HashMap<String, String> {
     let mut map = HashMap::new();
@@ -97,9 +97,11 @@ async fn main() {
         .route("/api/webmail/login", post(routes::webmail_login))
         .route("/api/webmail/logout", get(routes::webmail_logout));
 
-    // Static file serving (SvelteKit build output)
+    // Static file serving (SvelteKit build output) with SPA fallback
+    let index_path = format!("{}/index.html", cfg.static_dir);
     let static_service = ServeDir::new(&cfg.static_dir)
-        .append_index_html_on_directories(true);
+        .append_index_html_on_directories(true)
+        .fallback(ServeFile::new(&index_path));
 
     let app = Router::new()
         .merge(admin_api)
