@@ -1,23 +1,24 @@
 # akurai-mail-api
 
-Lightweight Rust API server for [AkurAI Mail](https://github.com/olibuijr/AkurAIMail). Replaces the Bun/Node SSR runtime (~61 MB RSS) with a single static binary (~3-5 MB RSS).
+Lightweight Rust API server for [AkurAI Mail](https://github.com/olibuijr/AkurAIMail). It serves the static SvelteKit UI and performs mail platform management natively in Rust.
 
 ## What it does
 
 - Serves the SvelteKit static frontend (built with `adapter-static`)
 - Handles admin and mailbox authentication via secure session cookies
-- Proxies all API calls to `akurai-mail-server` (the Python management script)
+- Manages Postfix, Dovecot, OpenDKIM, DNS checks, domains, anti-spam state, and Maildir webmail directly from Rust
+- Applies immutable cache headers for hashed frontend assets and response compression for compressible payloads
 - Rate-limits webmail API endpoints
 
 ## Architecture
 
 ```
-nginx (TLS) → akurai-mail-api (port 3000) → sudo akurai-mail-server (Python)
+nginx (TLS, gzip) → akurai-mail-api (127.0.0.1:3000)
                     ↓
-              static files (SvelteKit build output)
+              static files + native mail management
 ```
 
-The Rust binary does **zero business logic** — it's a thin authenticated proxy between the browser and the existing `akurai-mail-server` script. All mail management, DKIM, DNS, and webmail operations remain in the Python script.
+The Rust service is the request path. There is no Python helper or per-request `sudo` bridge in the deployed stack.
 
 ## Configuration
 
@@ -37,7 +38,7 @@ Environment variables:
 cargo build --release
 ```
 
-Binary output: `target/release/akurai-mail-api` (~1.6 MB stripped).
+Binary output: `target/release/akurai-mail-api`.
 
 ## Deploy
 
@@ -47,7 +48,7 @@ Requires the [AkurAIMail](https://github.com/olibuijr/AkurAIMail) frontend repo 
 ./deploy.sh
 ```
 
-This builds the Rust binary, builds the SvelteKit frontend, uploads both to the VM, installs the systemd service, and runs a healthcheck.
+This builds the Rust binary, builds the SvelteKit frontend, uploads both to the VM, installs the systemd service, configures nginx gzip, removes the old Python sudo helper, and runs public plus authenticated healthchecks.
 
 ## API Routes
 
@@ -75,6 +76,7 @@ This builds the Rust binary, builds the SvelteKit frontend, uploads both to the 
 - [tower-http](https://github.com/tower-rs/tower-http) — static file serving
 - [sha2](https://github.com/RustCrypto/hashes) + [subtle](https://github.com/dalek-cryptography/subtle) — constant-time auth
 - [tokio](https://tokio.rs) — async runtime
+- `mailparse`, `regex`, `base64` — Maildir/webmail parsing and attachment handling
 
 ## License
 

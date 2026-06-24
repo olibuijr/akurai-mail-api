@@ -11,8 +11,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::auth;
-use crate::proxy;
 use crate::config;
+use crate::native;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -35,7 +35,10 @@ fn parse_cookies(headers: &HeaderMap) -> HashMap<String, String> {
 
 fn is_admin(headers: &HeaderMap) -> bool {
     let cookies = parse_cookies(headers);
-    let val = cookies.get(auth::SESSION_COOKIE).map(|s| s.as_str()).unwrap_or("");
+    let val = cookies
+        .get(auth::SESSION_COOKIE)
+        .map(|s| s.as_str())
+        .unwrap_or("");
     let cfg = config::get();
     auth::is_authenticated(val, &cfg.admin_user, &cfg.admin_password)
 }
@@ -46,7 +49,10 @@ fn mailbox_email(headers: &HeaderMap) -> Option<String> {
     if is_admin(headers) {
         return None; // admin can specify email in request
     }
-    let val = cookies.get(auth::MAILBOX_SESSION_COOKIE).map(|s| s.as_str()).unwrap_or("");
+    let val = cookies
+        .get(auth::MAILBOX_SESSION_COOKIE)
+        .map(|s| s.as_str())
+        .unwrap_or("");
     auth::mailbox_from_session(val, &cfg.admin_password)
 }
 
@@ -58,10 +64,17 @@ fn json_err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({"ok": false, "error": msg}))).into_response()
 }
 
-fn proxy_result(args: &[&str]) -> Response {
-    match proxy::exec(args) {
-        Ok(val) => json_ok(val),
-        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+async fn native_result<F>(f: F) -> Response
+where
+    F: FnOnce() -> Result<Value, String> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(Ok(val)) => json_ok(val),
+        Ok(Err(e)) => json_err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Err(e) => json_err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("task failed: {e}"),
+        ),
     }
 }
 
@@ -79,14 +92,27 @@ pub struct LoginForm {
 
 pub async fn login(Json(body): Json<LoginForm>) -> Response {
     let cfg = config::get();
-    if !auth::validate_credentials(&body.email, &body.password, &cfg.admin_user, &cfg.admin_password) {
-        return json_err(StatusCode::UNAUTHORIZED, "The email or password is incorrect.");
+    if !auth::validate_credentials(
+        &body.email,
+        &body.password,
+        &cfg.admin_user,
+        &cfg.admin_password,
+    ) {
+        return json_err(
+            StatusCode::UNAUTHORIZED,
+            "The email or password is incorrect.",
+        );
     }
     let session = auth::session_value(&cfg.admin_user, &cfg.admin_password);
     let cookie = auth::set_cookie_header(auth::SESSION_COOKIE, &session, "/");
-    let next = if body.next.starts_with('/') { &body.next } else { "/" };
+    let next = if body.next.starts_with('/') {
+        &body.next
+    } else {
+        "/"
+    };
     let mut resp = Json(json!({"ok": true, "next": next})).into_response();
-    resp.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    resp.headers_mut()
+        .append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     resp
 }
 
@@ -99,8 +125,10 @@ pub async fn logout(headers: HeaderMap) -> Response {
     let c1 = auth::clear_cookie_header(auth::SESSION_COOKIE, "/");
     let c2 = auth::clear_cookie_header(auth::MAILBOX_SESSION_COOKIE, "/webmail");
     let mut resp = Redirect::to(target).into_response();
-    resp.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&c1).unwrap());
-    resp.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&c2).unwrap());
+    resp.headers_mut()
+        .append(header::SET_COOKIE, HeaderValue::from_str(&c1).unwrap());
+    resp.headers_mut()
+        .append(header::SET_COOKIE, HeaderValue::from_str(&c2).unwrap());
     resp
 }
 
@@ -108,11 +136,17 @@ pub async fn auth_check(headers: HeaderMap) -> Response {
     let cookies = parse_cookies(&headers);
     let cfg = config::get();
     let admin = {
-        let val = cookies.get(auth::SESSION_COOKIE).map(|s| s.as_str()).unwrap_or("");
+        let val = cookies
+            .get(auth::SESSION_COOKIE)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         auth::is_authenticated(val, &cfg.admin_user, &cfg.admin_password)
     };
     let mailbox = {
-        let val = cookies.get(auth::MAILBOX_SESSION_COOKIE).map(|s| s.as_str()).unwrap_or("");
+        let val = cookies
+            .get(auth::MAILBOX_SESSION_COOKIE)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         auth::mailbox_from_session(val, &cfg.admin_password)
     };
     json_ok(json!({
@@ -127,19 +161,19 @@ pub async fn auth_check(headers: HeaderMap) -> Response {
 // ---------------------------------------------------------------------------
 
 pub async fn status() -> Response {
-    proxy_result(&["status"])
+    native_result(native::status).await
 }
 
 pub async fn metrics() -> Response {
-    proxy_result(&["metrics"])
+    native_result(native::metrics).await
 }
 
 pub async fn dns() -> Response {
-    proxy_result(&["dns"])
+    native_result(native::dns).await
 }
 
 pub async fn domain_list() -> Response {
-    proxy_result(&["domain-list"])
+    native_result(native::domain_list).await
 }
 
 #[derive(Deserialize)]
@@ -155,29 +189,47 @@ pub struct ActionBody {
     pub domain: Option<String>,
     #[serde(default)]
     pub policy: Option<Value>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 pub async fn actions(Json(body): Json<ActionBody>) -> Response {
     match body.action.as_str() {
-        "add-user" => proxy_result(&["add-user", body.email.as_deref().unwrap_or("")]),
-        "set-password" => proxy_result(&["set-password", body.email.as_deref().unwrap_or("")]),
-        "add-alias" => proxy_result(&["add-alias", body.alias.as_deref().unwrap_or(""), body.target.as_deref().unwrap_or("")]),
+        "add-user" => {
+            let email = body.email.unwrap_or_default();
+            let password = body.password;
+            native_result(move || native::add_user(&email, password.as_deref())).await
+        }
+        "set-password" => {
+            let email = body.email.unwrap_or_default();
+            let password = body.password;
+            native_result(move || native::set_password(&email, password.as_deref())).await
+        }
+        "add-alias" => {
+            let alias = body.alias.unwrap_or_default();
+            let target = body.target.unwrap_or_default();
+            native_result(move || native::add_alias(&alias, &target)).await
+        }
         "anti-spam-config" => {
-            let policy_str = body.policy.map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-            let args_owned = vec!["anti-spam-config".to_string(), policy_str];
-            let args: Vec<&str> = args_owned.iter().map(|s| s.as_str()).collect();
-            proxy_result(&args)
+            let policy = body.policy.unwrap_or_else(|| json!({}));
+            native_result(move || native::anti_spam_config(policy)).await
         }
         "anti-spam-scan" => {
-            if let Some(ref email) = body.email {
-                proxy_result(&["anti-spam-scan", email])
-            } else {
-                proxy_result(&["anti-spam-scan"])
-            }
+            let email = body.email;
+            native_result(move || native::anti_spam_scan(email.as_deref())).await
         }
-        "domain-add" => proxy_result(&["domain-add", body.domain.as_deref().unwrap_or("")]),
-        "domain-check" => proxy_result(&["domain-check", body.domain.as_deref().unwrap_or("")]),
-        "domain-remove" => proxy_result(&["domain-remove", body.domain.as_deref().unwrap_or("")]),
+        "domain-add" => {
+            let domain = body.domain.unwrap_or_default();
+            native_result(move || native::domain_add(&domain)).await
+        }
+        "domain-check" => {
+            let domain = body.domain.unwrap_or_default();
+            native_result(move || native::domain_check(&domain)).await
+        }
+        "domain-remove" => {
+            let domain = body.domain.unwrap_or_default();
+            native_result(move || native::domain_remove(&domain)).await
+        }
         _ => json_err(StatusCode::BAD_REQUEST, "unknown action"),
     }
 }
@@ -195,25 +247,36 @@ pub struct WebmailLoginBody {
 }
 
 pub async fn webmail_login(Json(body): Json<WebmailLoginBody>) -> Response {
-    let result = proxy::exec(&["validate-login", &body.email, &body.password]);
-    match result {
-        Ok(val) if val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) => {
+    let email = body.email.clone();
+    let password = body.password.clone();
+    match tokio::task::spawn_blocking(move || native::validate_login(&email, &password)).await {
+        Ok(Ok(true)) => {
             let cfg = config::get();
             let session = auth::mailbox_session_value(&body.email, &cfg.admin_password);
-            let cookie = auth::set_cookie_header(auth::MAILBOX_SESSION_COOKIE, &session, "/webmail");
-            let next = if body.next.starts_with("/webmail") { &body.next } else { "/webmail" };
+            let cookie =
+                auth::set_cookie_header(auth::MAILBOX_SESSION_COOKIE, &session, "/webmail");
+            let next = if body.next.starts_with("/webmail") {
+                &body.next
+            } else {
+                "/webmail"
+            };
             let mut resp = Json(json!({"ok": true, "next": next})).into_response();
-            resp.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+            resp.headers_mut()
+                .append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
             resp
         }
-        _ => json_err(StatusCode::UNAUTHORIZED, "The email or password is incorrect."),
+        _ => json_err(
+            StatusCode::UNAUTHORIZED,
+            "The email or password is incorrect.",
+        ),
     }
 }
 
 pub async fn webmail_logout() -> Response {
     let cookie = auth::clear_cookie_header(auth::MAILBOX_SESSION_COOKIE, "/webmail");
     let mut resp = Redirect::to("/webmail/login").into_response();
-    resp.headers_mut().append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
+    resp.headers_mut()
+        .append(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap());
     resp
 }
 
@@ -232,9 +295,9 @@ pub async fn webmail_get(headers: HeaderMap, Query(q): Query<WebmailQuery>) -> R
     let Some(email) = email else {
         return json_err(StatusCode::BAD_REQUEST, "email is required");
     };
-    let folder = q.folder.as_deref().unwrap_or("Inbox");
-    let query = q.query.as_deref().unwrap_or("");
-    proxy_result(&["webmail-state", &email, "--folder", folder, "--query", query])
+    let folder = q.folder.unwrap_or_else(|| "Inbox".to_string());
+    let query = q.query.unwrap_or_default();
+    native_result(move || native::webmail_state(&email, &folder, &query)).await
 }
 
 // Rate limiter for webmail POST
@@ -295,40 +358,47 @@ pub async fn webmail_post(headers: HeaderMap, Json(body): Json<WebmailPostBody>)
     };
 
     let id = body.id.as_deref().unwrap_or("");
-    let payload = |v: &Option<Value>| v.as_ref().map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-
     match body.action.as_str() {
-        "read" => proxy_result(&["webmail-read", &email, id, "--mark-read"]),
+        "read" => {
+            let id = id.to_string();
+            native_result(move || native::webmail_read(&email, &id, true)).await
+        }
         "send" => {
-            let p = payload(&body.message);
-            proxy_result(&["webmail-send", &email, &p])
+            let p = body.message.unwrap_or_else(|| json!({}));
+            native_result(move || native::webmail_send(&email, p)).await
         }
         "draft" => {
-            let p = payload(&body.message);
-            proxy_result(&["webmail-draft", &email, &p])
+            let p = body.message.unwrap_or_else(|| json!({}));
+            native_result(move || native::webmail_draft(&email, p)).await
         }
         "message" => {
             let ma = body.message_action.as_deref().unwrap_or("");
             let target = body.target.as_deref().unwrap_or("Archive");
-            proxy_result(&["webmail-action", &email, id, ma, "--target", target])
+            let id = id.to_string();
+            let ma = ma.to_string();
+            let target = target.to_string();
+            native_result(move || native::webmail_action(&email, &id, &ma, &target)).await
         }
         "config" => {
             let kind = body.kind.as_deref().unwrap_or("");
-            let p = payload(&body.value);
-            proxy_result(&["webmail-config", &email, kind, &p])
+            let kind = kind.to_string();
+            let p = body.value.unwrap_or_else(|| json!({}));
+            native_result(move || native::webmail_config(&email, &kind, p)).await
         }
         "apply-rules" => {
-            let folder = body.folder.as_deref().unwrap_or("Inbox");
-            proxy_result(&["webmail-apply-rules", &email, "--folder", folder])
+            let folder = body.folder.unwrap_or_else(|| "Inbox".to_string());
+            native_result(move || native::webmail_apply_rules(&email, &folder)).await
         }
-        "export" => proxy_result(&["webmail-export", &email]),
+        "export" => native_result(native::webmail_export).await,
         "import" => {
-            let p = payload(&body.value);
-            proxy_result(&["webmail-import", &email, &p])
+            let p = body.value.unwrap_or_else(|| json!({}));
+            native_result(move || native::webmail_import(p)).await
         }
         "attachment" => {
             let idx = body.index.as_deref().unwrap_or("");
-            proxy_result(&["webmail-attachment", &email, id, idx])
+            let id = id.to_string();
+            let idx = idx.to_string();
+            native_result(move || native::webmail_attachment(&email, &id, &idx)).await
         }
         _ => json_err(StatusCode::BAD_REQUEST, "unknown action"),
     }

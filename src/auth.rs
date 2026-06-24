@@ -25,7 +25,12 @@ pub fn mailbox_session_value(email: &str, admin_password: &str) -> String {
     format!("{email}:{token}")
 }
 
-pub fn validate_credentials(email: &str, password: &str, admin_user: &str, admin_password: &str) -> bool {
+pub fn validate_credentials(
+    email: &str,
+    password: &str,
+    admin_user: &str,
+    admin_password: &str,
+) -> bool {
     if admin_password.is_empty() {
         return false;
     }
@@ -59,9 +64,7 @@ pub fn mailbox_from_session(cookie_value: &str, admin_password: &str) -> Option<
 }
 
 pub fn set_cookie_header(name: &str, value: &str, path: &str) -> String {
-    format!(
-        "{name}={value}; Path={path}; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE}"
-    )
+    format!("{name}={value}; Path={path}; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE}")
 }
 
 pub fn clear_cookie_header(name: &str, path: &str) -> String {

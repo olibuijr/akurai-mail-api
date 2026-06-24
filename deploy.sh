@@ -47,10 +47,57 @@ step "4/5  Install service"
 ssh "$SSH_HOST" "sudo bash -s" <<'INSTALL'
 set -euo pipefail
 
-# Install the akurai-mail-server helper script if present
-if [ -f /opt/akurai-mail-ui/scripts/akurai-mail-server ]; then
-  install -m 755 /opt/akurai-mail-ui/scripts/akurai-mail-server /usr/local/sbin/akurai-mail-server
+get_unit_env() {
+  local key="$1"
+  systemctl cat akurai-mail-ui.service 2>/dev/null \
+    | awk -F= -v key="$key" '$1 == "Environment" && $2 == key {print substr($0, index($0, $3))}' \
+    | tail -1
+}
+
+if [ -f /etc/akurai-mail-ui.env ]; then
+  set -a
+  . /etc/akurai-mail-ui.env
+  set +a
 fi
+
+admin_user="${AKURAI_ADMIN_USER:-$(get_unit_env AKURAI_ADMIN_USER)}"
+admin_password="${AKURAI_ADMIN_PASSWORD:-$(get_unit_env AKURAI_ADMIN_PASSWORD)}"
+if [ -z "$admin_user" ]; then
+  admin_user="olibuijr@olibuijr.com"
+fi
+if [ -z "$admin_password" ]; then
+  admin_password="$(openssl rand -base64 32)"
+fi
+
+umask 077
+cat > /etc/akurai-mail-ui.env <<EOF
+AKURAI_ADMIN_USER=$admin_user
+AKURAI_ADMIN_PASSWORD=$admin_password
+AKURAI_LISTEN=127.0.0.1:3000
+AKURAI_STATIC_DIR=/opt/akurai-mail-ui/static
+RUST_LOG=akurai_mail_api=info
+EOF
+chmod 0600 /etc/akurai-mail-ui.env
+
+rm -f /etc/sudoers.d/akurai-mail-server
+rm -f /usr/local/sbin/akurai-mail-server
+
+cat > /etc/nginx/conf.d/akurai-mail-performance.conf <<'EOF'
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 512;
+gzip_types
+  text/plain
+  text/css
+  text/javascript
+  application/javascript
+  application/json
+  application/manifest+json
+  application/wasm
+  image/svg+xml;
+EOF
 
 cat > /etc/systemd/system/akurai-mail-ui.service <<EOF
 [Unit]
@@ -61,21 +108,19 @@ After=network.target
 Type=simple
 ExecStart=/opt/akurai-mail-ui/akurai-mail-api
 WorkingDirectory=/opt/akurai-mail-ui
-Environment=AKURAI_ADMIN_USER=olibuijr@olibuijr.com
-Environment=AKURAI_ADMIN_PASSWORD=M3ga.p4bb1!!!
-Environment=AKURAI_LISTEN=127.0.0.1:3000
-Environment=AKURAI_STATIC_DIR=/opt/akurai-mail-ui/static
-Environment=RUST_LOG=akurai_mail_api=info
+EnvironmentFile=/etc/akurai-mail-ui.env
 Restart=always
 RestartSec=3
-User=ubuntu
-Group=ubuntu
+User=root
+Group=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+nginx -t >/dev/null
+systemctl reload nginx
 systemctl restart akurai-mail-ui
 echo "  [done] service restarted"
 INSTALL
@@ -90,6 +135,14 @@ if ssh "$SSH_HOST" "curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1:30
 else
   echo "ERROR: healthcheck failed"
   echo "Check: ssh $SSH_HOST 'sudo journalctl -u $SERVICE -n 50'"
+  exit 1
+fi
+
+if ssh "$SSH_HOST" "set -a; . /etc/akurai-mail-ui.env; set +a; session=\$(printf '%s' \"\$AKURAI_ADMIN_USER:\$AKURAI_ADMIN_PASSWORD\" | sha256sum | awk '{print \$1}'); curl -fsS -o /dev/null -w '%{http_code}' -b akurai_session=\$session http://127.0.0.1:3000/api/status" | grep -q 200; then
+  log "Authenticated API healthcheck passed"
+else
+  echo "ERROR: authenticated API healthcheck failed"
+  echo "Check: ssh $SSH_HOST 'sudo journalctl -u $SERVICE -n 80'"
   exit 1
 fi
 
