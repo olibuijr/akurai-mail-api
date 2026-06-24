@@ -65,7 +65,7 @@ This builds the Rust binary, builds the SvelteKit frontend, uploads both to the 
 - `GET /api/metrics/stream` — SSE stream for live status updates
 - `GET /api/dns` — DNS records
 - `GET /api/domain-list` — managed domains
-- `POST /api/actions` — admin operations (add-user, set-password, etc.)
+- `POST /api/actions` — admin operations (`domain-autopilot`, `add-user`, `set-password`, etc.)
 
 ### Webmail (admin or mailbox session)
 - `GET /api/webmail` — mailbox state (messages, folders)

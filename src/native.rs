@@ -19,10 +19,12 @@ const WEBMAIL_STATE: &str = "/var/lib/akurai-mail/webmail.json";
 const DOVECOT_USERS: &str = "/etc/dovecot/users";
 const POSTFIX_VMAILBOX: &str = "/etc/postfix/vmailbox";
 const POSTFIX_VIRTUAL: &str = "/etc/postfix/virtual";
+const POSTFIX_VMAILBOX_DOMAINS: &str = "/etc/postfix/vmailbox_domains";
 const DOMAINS_STATE: &str = "/var/lib/akurai-mail/domains.json";
-const OPENDKIM_KEYTABLE: &str = "/etc/opendkim/KeyTable";
-const OPENDKIM_SIGNINGTABLE: &str = "/etc/opendkim/SigningTable";
-const OPENDKIM_TRUSTEDHOSTS: &str = "/etc/opendkim/TrustedHosts";
+const OPENDKIM_CONF: &str = "/etc/opendkim.conf";
+const OPENDKIM_KEYTABLE_FALLBACK: &str = "/etc/opendkim/key.table";
+const OPENDKIM_SIGNINGTABLE_FALLBACK: &str = "/etc/opendkim/signing.table";
+const OPENDKIM_TRUSTEDHOSTS_FALLBACK: &str = "/etc/opendkim/trusted.hosts";
 const OPENDKIM_KEYS_DIR: &str = "/etc/opendkim/keys";
 const DOMAIN: &str = "olibuijr.com";
 const HOSTNAME: &str = "mail.olibuijr.com";
@@ -211,6 +213,17 @@ fn command_checked(cmd: &str, args: &[&str]) -> NativeResult<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn normalize_domain_name(domain: &str) -> NativeResult<String> {
+    let domain = domain.trim().trim_end_matches('.').to_lowercase();
+    let valid =
+        Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
+    if valid.is_match(&domain) {
+        Ok(domain)
+    } else {
+        Err("invalid domain name".to_string())
+    }
+}
+
 fn string_array(value: &Value) -> Vec<String> {
     value
         .as_array()
@@ -227,6 +240,85 @@ fn object_mut(value: &mut Value) -> &mut Map<String, Value> {
         *value = json!({});
     }
     value.as_object_mut().unwrap()
+}
+
+fn trim_table_prefix(value: &str) -> &str {
+    for prefix in ["refile:", "file:"] {
+        if let Some(path) = value.strip_prefix(prefix) {
+            return path;
+        }
+    }
+    value
+}
+
+fn opendkim_config_path(config: &str, key: &str, fallback: &str) -> String {
+    config
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let mut parts = line.split_whitespace();
+            let found = parts.next()?;
+            let value = parts.next()?;
+            if found == key {
+                Some(trim_table_prefix(value).to_string())
+            } else {
+                None
+            }
+        })
+        .next()
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn opendkim_path(key: &str, fallback: &str) -> String {
+    let config = fs::read_to_string(OPENDKIM_CONF).unwrap_or_default();
+    opendkim_config_path(&config, key, fallback)
+}
+
+fn active_keytable() -> String {
+    opendkim_path("KeyTable", OPENDKIM_KEYTABLE_FALLBACK)
+}
+
+fn active_signingtable() -> String {
+    opendkim_path("SigningTable", OPENDKIM_SIGNINGTABLE_FALLBACK)
+}
+
+fn active_trustedhosts() -> String {
+    let config = fs::read_to_string(OPENDKIM_CONF).unwrap_or_default();
+    opendkim_config_path(&config, "InternalHosts", OPENDKIM_TRUSTEDHOSTS_FALLBACK)
+}
+
+fn first_domain_token(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let token = line
+        .split_whitespace()
+        .next()?
+        .trim_end_matches('.')
+        .to_lowercase();
+    normalize_domain_name(&token).ok()
+}
+
+fn domains_from_table(text: &str) -> Vec<String> {
+    let mut rows: Vec<String> = text.lines().filter_map(first_domain_token).collect();
+    rows.sort();
+    rows.dedup();
+    rows
+}
+
+fn configured_postfix_domains() -> Vec<String> {
+    domains_from_table(&fs::read_to_string(POSTFIX_VMAILBOX_DOMAINS).unwrap_or_default())
+}
+
+fn merge_domain_lists(mut domains: Vec<String>, extra: &[String]) -> Vec<String> {
+    domains.extend(extra.iter().cloned());
+    domains.sort();
+    domains.dedup();
+    domains
 }
 
 fn prepend_event(data: &mut Value, key: &str, text: String, keep: usize) {
@@ -538,7 +630,9 @@ fn sanitize_command(command: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_command;
+    use super::{
+        domains_from_table, normalize_domain_name, opendkim_config_path, sanitize_command,
+    };
 
     #[test]
     fn command_redaction_hides_tokens_and_cookies() {
@@ -551,6 +645,50 @@ mod tests {
         assert!(sanitized.contains("token=[redacted]"));
         assert!(!sanitized.contains("abc123"));
         assert!(!sanitized.contains("hunter2"));
+    }
+
+    #[test]
+    fn opendkim_path_parser_strips_table_prefixes() {
+        let config = r#"
+            KeyTable refile:/etc/opendkim/key.table
+            SigningTable file:/etc/opendkim/signing.table
+            InternalHosts /etc/opendkim/trusted.hosts
+        "#;
+
+        assert_eq!(
+            opendkim_config_path(config, "KeyTable", "/fallback"),
+            "/etc/opendkim/key.table"
+        );
+        assert_eq!(
+            opendkim_config_path(config, "SigningTable", "/fallback"),
+            "/etc/opendkim/signing.table"
+        );
+        assert_eq!(
+            opendkim_config_path(config, "InternalHosts", "/fallback"),
+            "/etc/opendkim/trusted.hosts"
+        );
+        assert_eq!(
+            opendkim_config_path(config, "Missing", "/fallback"),
+            "/fallback"
+        );
+    }
+
+    #[test]
+    fn postfix_domain_map_parser_accepts_hash_values() {
+        let domains = domains_from_table(
+            r#"
+            # comment
+            olibUijr.com OK
+            golfsetridak.is OK
+            bad_domain OK
+            "#,
+        );
+
+        assert_eq!(domains, vec!["golfsetridak.is", "olibuijr.com"]);
+        assert_eq!(
+            normalize_domain_name("Example.COM."),
+            Ok("example.com".to_string())
+        );
     }
 }
 
@@ -832,6 +970,90 @@ fn domain_dns_records(domain: &str) -> Value {
     Value::Array(records)
 }
 
+fn check_row(name: &str, ok: bool, detail: impl Into<String>) -> Value {
+    json!({ "name": name, "ok": ok, "detail": detail.into() })
+}
+
+fn checks_ok(checks: &Value) -> bool {
+    checks
+        .as_array()
+        .map(|rows| rows.iter().all(|c| c["ok"].as_bool().unwrap_or(false)))
+        .unwrap_or(false)
+}
+
+fn domain_local_checks(domain: &str) -> Value {
+    let postfix_domains = configured_postfix_domains();
+    let postconf_domains = command_output("postconf", &["-h", "virtual_mailbox_domains"]);
+    let keytable = active_keytable();
+    let signingtable = active_signingtable();
+    let trustedhosts = active_trustedhosts();
+    let key_dir = Path::new(OPENDKIM_KEYS_DIR).join(domain);
+    let private_key = key_dir.join("mail.private");
+    let dkim = read_dkim_public_key(domain);
+    let keytable_text = fs::read_to_string(&keytable).unwrap_or_default();
+    let signingtable_text = fs::read_to_string(&signingtable).unwrap_or_default();
+    let trustedhosts_text = fs::read_to_string(&trustedhosts).unwrap_or_default();
+    let vmail_dir = Path::new("/var/vmail").join(domain);
+
+    Value::Array(vec![
+        check_row(
+            "Postfix domain map",
+            postfix_domains.iter().any(|d| d == domain),
+            POSTFIX_VMAILBOX_DOMAINS,
+        ),
+        check_row(
+            "Postfix active lookup",
+            postconf_domains.contains(POSTFIX_VMAILBOX_DOMAINS),
+            postconf_domains.trim().to_string(),
+        ),
+        check_row(
+            "DKIM private key",
+            private_key.exists(),
+            private_key.display().to_string(),
+        ),
+        check_row(
+            "DKIM public record",
+            !dkim.is_empty(),
+            if dkim.is_empty() { "missing" } else { "ready" },
+        ),
+        check_row(
+            "OpenDKIM key table",
+            keytable_text.contains(domain),
+            keytable,
+        ),
+        check_row(
+            "OpenDKIM signing table",
+            signingtable_text.contains(&format!("@{domain}")),
+            signingtable,
+        ),
+        check_row(
+            "OpenDKIM trusted hosts",
+            trustedhosts_text.lines().any(|line| line.trim() == domain),
+            trustedhosts,
+        ),
+        check_row(
+            "Virtual mailbox root",
+            vmail_dir.exists(),
+            vmail_dir.display().to_string(),
+        ),
+        check_row(
+            "Postfix service",
+            command_output("systemctl", &["is-active", "postfix"]).trim() == "active",
+            "postfix",
+        ),
+        check_row(
+            "Dovecot service",
+            command_output("systemctl", &["is-active", "dovecot"]).trim() == "active",
+            "dovecot",
+        ),
+        check_row(
+            "OpenDKIM service",
+            command_output("systemctl", &["is-active", "opendkim"]).trim() == "active",
+            "opendkim",
+        ),
+    ])
+}
+
 fn dns_check_domain(domain: &str) -> Value {
     let mut checks = vec![
         json!({ "name": domain, "type": "MX", "expect": format!("10 {}", HOSTNAME.trim_end_matches('.')) }),
@@ -870,6 +1092,14 @@ fn dns_check_domain(domain: &str) -> Value {
     Value::Array(checks)
 }
 
+fn domain_status(local_ok: bool, dns_ok: bool) -> &'static str {
+    match (local_ok, dns_ok) {
+        (true, true) => "verified",
+        (true, false) => "configured",
+        (false, _) => "attention",
+    }
+}
+
 fn load_domains() -> NativeResult<Value> {
     load_json(
         DOMAINS_STATE,
@@ -904,17 +1134,19 @@ fn build_domain_list() -> NativeResult<Value> {
     let mut rows = Vec::new();
     for item in domains {
         let domain = item["domain"].as_str().unwrap_or(DOMAIN);
-        let checks = dns_check_domain(domain);
-        let ok = checks
-            .as_array()
-            .map(|rows| rows.iter().all(|c| c["ok"].as_bool().unwrap_or(false)))
-            .unwrap_or(false);
+        let local_checks = domain_local_checks(domain);
+        let dns_checks = dns_check_domain(domain);
+        let local_ok = checks_ok(&local_checks);
+        let dns_ok = checks_ok(&dns_checks);
         rows.push(json!({
             "domain": domain,
             "addedAt": item["addedAt"].as_u64().unwrap_or(0),
-            "status": if ok { "verified" } else { "pending" },
+            "lastConfiguredAt": item["lastConfiguredAt"].as_u64().unwrap_or(0),
+            "lastCheckedAt": item["lastCheckedAt"].as_u64().unwrap_or(0),
+            "status": domain_status(local_ok, dns_ok),
             "dnsRecords": domain_dns_records(domain),
-            "dnsChecks": checks,
+            "localChecks": local_checks,
+            "dnsChecks": dns_checks,
         }));
     }
     Ok(json!({ "ok": true, "domains": rows }))
@@ -946,6 +1178,10 @@ fn known_domains() -> Vec<String> {
         }
     }
     domains
+}
+
+fn managed_domains_including(domain: &str) -> Vec<String> {
+    merge_domain_lists(known_domains(), &[domain.to_string()])
 }
 
 fn ensure_mailbox(email: &str, password: &str) -> NativeResult<()> {
@@ -1182,20 +1418,49 @@ pub fn anti_spam_scan(email: Option<&str>) -> NativeResult<Value> {
     )
 }
 
-fn configure_domain_mail(domain: &str) -> NativeResult<()> {
-    let vmd_file = Path::new("/etc/postfix/vmailbox_domains");
-    let mut domains: Vec<String> = fs::read_to_string(vmd_file)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .collect();
-    if !domains.iter().any(|d| d == domain) {
-        domains.push(domain.to_string());
-        fs::write(vmd_file, domains.join("\n") + "\n")
-            .map_err(|e| format!("write {}: {e}", vmd_file.display()))?;
-    }
+fn write_postfix_domain_map(domains: &[String], preserve_existing: bool) -> NativeResult<()> {
+    let domains = if preserve_existing {
+        merge_domain_lists(configured_postfix_domains(), domains)
+    } else {
+        merge_domain_lists(Vec::new(), domains)
+    };
+    let lines = domains
+        .iter()
+        .map(|domain| format!("{domain} OK"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(POSTFIX_VMAILBOX_DOMAINS, lines)
+        .map_err(|e| format!("write {POSTFIX_VMAILBOX_DOMAINS}: {e}"))?;
+    command_checked("postmap", &[POSTFIX_VMAILBOX_DOMAINS])?;
+    command_checked(
+        "postconf",
+        &[
+            "-e",
+            &format!("virtual_mailbox_domains=hash:{POSTFIX_VMAILBOX_DOMAINS}"),
+        ],
+    )?;
+    command_checked(
+        "postconf",
+        &[
+            "-e",
+            &format!("virtual_mailbox_maps=hash:{POSTFIX_VMAILBOX}"),
+        ],
+    )?;
+    command_checked(
+        "postconf",
+        &["-e", &format!("virtual_alias_maps=hash:{POSTFIX_VIRTUAL}")],
+    )?;
+    command_checked("postconf", &["-e", "smtpd_milters=inet:127.0.0.1:8891"])?;
+    command_checked("postconf", &["-e", "non_smtpd_milters=inet:127.0.0.1:8891"])?;
+    command_checked("postconf", &["-e", "milter_protocol=6"])?;
+    command_checked("postconf", &["-e", "milter_default_action=accept"])?;
+    Ok(())
+}
 
+fn configure_domain_mail(domain: &str) -> NativeResult<()> {
+    let domains = managed_domains_including(domain);
+    write_postfix_domain_map(&domains, true)?;
     let key_dir = Path::new(OPENDKIM_KEYS_DIR).join(domain);
     if !key_dir.join("mail.private").exists() {
         fs::create_dir_all(&key_dir).map_err(|e| format!("mkdir {}: {e}", key_dir.display()))?;
@@ -1227,8 +1492,11 @@ fn configure_domain_mail(domain: &str) -> NativeResult<()> {
         );
     }
 
+    let keytable = active_keytable();
+    let signingtable = active_signingtable();
+    let trustedhosts = active_trustedhosts();
     replace_lines_containing(
-        OPENDKIM_KEYTABLE,
+        &keytable,
         domain,
         format!(
             "mail._domainkey.{domain} {domain}:mail:{}/mail.private",
@@ -1236,19 +1504,19 @@ fn configure_domain_mail(domain: &str) -> NativeResult<()> {
         ),
     )?;
     replace_lines_containing(
-        OPENDKIM_SIGNINGTABLE,
+        &signingtable,
         domain,
         format!("*@{domain} mail._domainkey.{domain}"),
     )?;
-    let mut trusted: Vec<String> = fs::read_to_string(OPENDKIM_TRUSTEDHOSTS)
+    let mut trusted: Vec<String> = fs::read_to_string(&trustedhosts)
         .unwrap_or_else(|_| "127.0.0.1\n::1\nlocalhost\n".to_string())
         .lines()
         .map(ToString::to_string)
         .collect();
     if !trusted.iter().any(|d| d == domain) {
         trusted.push(domain.to_string());
-        fs::write(OPENDKIM_TRUSTEDHOSTS, trusted.join("\n") + "\n")
-            .map_err(|e| format!("write {OPENDKIM_TRUSTEDHOSTS}: {e}"))?;
+        fs::write(&trustedhosts, trusted.join("\n") + "\n")
+            .map_err(|e| format!("write {trustedhosts}: {e}"))?;
     }
     let vmail_dir = Path::new("/var/vmail").join(domain);
     fs::create_dir_all(&vmail_dir).map_err(|e| format!("mkdir {}: {e}", vmail_dir.display()))?;
@@ -1272,48 +1540,110 @@ fn replace_lines_containing(path: &str, needle: &str, new_line: String) -> Nativ
     fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("write {path}: {e}"))
 }
 
-pub fn domain_add(domain: &str) -> NativeResult<Value> {
-    clear_read_caches();
-    let domain = domain.trim().to_lowercase();
-    let valid =
-        Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$").unwrap();
-    if !valid.is_match(&domain) {
-        return Ok(json!({ "ok": false, "error": "invalid domain name" }));
-    }
+fn upsert_domain_state(
+    domain: &str,
+    status: &str,
+    configured: bool,
+    checked: bool,
+) -> NativeResult<bool> {
     let mut data = load_domains()?;
     let domains = data["domains"]
         .as_array_mut()
         .ok_or_else(|| "invalid domains state".to_string())?;
-    if domains
-        .iter()
-        .any(|d| d["domain"].as_str() == Some(&domain))
+    let ts = now();
+    if let Some(row) = domains
+        .iter_mut()
+        .find(|d| d["domain"].as_str() == Some(domain))
     {
-        return Ok(json!({ "ok": false, "error": "domain already exists" }));
+        row["status"] = json!(status);
+        if configured {
+            row["lastConfiguredAt"] = json!(ts);
+        }
+        if checked {
+            row["lastCheckedAt"] = json!(ts);
+        }
+        save_domains(&data)?;
+        return Ok(false);
     }
-    configure_domain_mail(&domain)?;
-    domains.push(json!({ "domain": domain, "addedAt": now(), "status": "active" }));
+    domains.push(json!({
+        "domain": domain,
+        "addedAt": ts,
+        "status": status,
+        "lastConfiguredAt": if configured { ts } else { 0 },
+        "lastCheckedAt": if checked { ts } else { 0 },
+    }));
     save_domains(&data)?;
+    Ok(true)
+}
+
+pub fn domain_autopilot(domain: &str) -> NativeResult<Value> {
+    clear_read_caches();
+    let domain = match normalize_domain_name(domain) {
+        Ok(domain) => domain,
+        Err(error) => return Ok(json!({ "ok": false, "error": error })),
+    };
+    configure_domain_mail(&domain)?;
+    let local_checks = domain_local_checks(&domain);
+    let dns_checks = dns_check_domain(&domain);
+    let local_ok = checks_ok(&local_checks);
+    let dns_ok = checks_ok(&dns_checks);
+    let status = domain_status(local_ok, dns_ok);
+    let created = upsert_domain_state(&domain, status, true, true)?;
     let mut state = load_json(STATE, state_default())?;
-    prepend_event(&mut state, "events", format!("Domain added: {domain}"), 40);
+    prepend_event(
+        &mut state,
+        "events",
+        format!("Domain autopilot: {domain} -> {status}"),
+        40,
+    );
     save_json(STATE, &state)?;
-    Ok(json!({ "ok": true, "domain": domain, "dnsRecords": domain_dns_records(&domain) }))
+    Ok(json!({
+        "ok": true,
+        "domain": domain,
+        "created": created,
+        "status": status,
+        "configured": local_ok,
+        "verified": local_ok && dns_ok,
+        "dnsRecords": domain_dns_records(&domain),
+        "localChecks": local_checks,
+        "dnsChecks": dns_checks,
+    }))
+}
+
+pub fn domain_add(domain: &str) -> NativeResult<Value> {
+    domain_autopilot(domain)
 }
 
 pub fn domain_check(domain: &str) -> NativeResult<Value> {
-    let domain = domain.trim().to_lowercase();
-    let checks = dns_check_domain(&domain);
-    let ok = checks
-        .as_array()
-        .map(|rows| rows.iter().all(|c| c["ok"].as_bool().unwrap_or(false)))
-        .unwrap_or(false);
-    Ok(
-        json!({ "ok": true, "domain": domain, "status": if ok { "verified" } else { "pending" }, "dnsRecords": domain_dns_records(&domain), "dnsChecks": checks }),
-    )
+    clear_read_caches();
+    let domain = match normalize_domain_name(domain) {
+        Ok(domain) => domain,
+        Err(error) => return Ok(json!({ "ok": false, "error": error })),
+    };
+    let local_checks = domain_local_checks(&domain);
+    let dns_checks = dns_check_domain(&domain);
+    let local_ok = checks_ok(&local_checks);
+    let dns_ok = checks_ok(&dns_checks);
+    let status = domain_status(local_ok, dns_ok);
+    let _ = upsert_domain_state(&domain, status, false, true)?;
+    Ok(json!({
+        "ok": true,
+        "domain": domain,
+        "status": status,
+        "configured": local_ok,
+        "verified": local_ok && dns_ok,
+        "dnsRecords": domain_dns_records(&domain),
+        "localChecks": local_checks,
+        "dnsChecks": dns_checks,
+    }))
 }
 
 pub fn domain_remove(domain: &str) -> NativeResult<Value> {
     clear_read_caches();
-    let domain = domain.trim().to_lowercase();
+    let domain = match normalize_domain_name(domain) {
+        Ok(domain) => domain,
+        Err(error) => return Ok(json!({ "ok": false, "error": error })),
+    };
     if domain == DOMAIN {
         return Ok(json!({ "ok": false, "error": "cannot remove the primary domain" }));
     }
@@ -1322,7 +1652,10 @@ pub fn domain_remove(domain: &str) -> NativeResult<Value> {
         domains.retain(|d| d["domain"].as_str() != Some(&domain));
     }
     save_domains(&data)?;
-    for table in [OPENDKIM_KEYTABLE, OPENDKIM_SIGNINGTABLE] {
+    write_postfix_domain_map(&known_domains(), false)?;
+    let keytable = active_keytable();
+    let signingtable = active_signingtable();
+    for table in [keytable.as_str(), signingtable.as_str()] {
         let lines: Vec<String> = fs::read_to_string(table)
             .unwrap_or_default()
             .lines()
@@ -1331,22 +1664,15 @@ pub fn domain_remove(domain: &str) -> NativeResult<Value> {
             .collect();
         fs::write(table, lines.join("\n") + "\n").map_err(|e| format!("write {table}: {e}"))?;
     }
-    let lines: Vec<String> = fs::read_to_string(OPENDKIM_TRUSTEDHOSTS)
+    let trustedhosts = active_trustedhosts();
+    let lines: Vec<String> = fs::read_to_string(&trustedhosts)
         .unwrap_or_default()
         .lines()
         .filter(|line| line.trim() != domain)
         .map(ToString::to_string)
         .collect();
-    fs::write(OPENDKIM_TRUSTEDHOSTS, lines.join("\n") + "\n")
-        .map_err(|e| format!("write {OPENDKIM_TRUSTEDHOSTS}: {e}"))?;
-    let vmd = "/etc/postfix/vmailbox_domains";
-    let lines: Vec<String> = fs::read_to_string(vmd)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.trim() != domain)
-        .map(ToString::to_string)
-        .collect();
-    fs::write(vmd, lines.join("\n") + "\n").map_err(|e| format!("write {vmd}: {e}"))?;
+    fs::write(&trustedhosts, lines.join("\n") + "\n")
+        .map_err(|e| format!("write {trustedhosts}: {e}"))?;
     let _ = command_status("systemctl", &["reload", "opendkim"]);
     let _ = command_status("systemctl", &["reload", "postfix"]);
     let mut state = load_json(STATE, state_default())?;

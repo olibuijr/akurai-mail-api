@@ -253,6 +253,10 @@ pub async fn actions(Json(body): Json<ActionBody>) -> Response {
             let domain = body.domain.unwrap_or_default();
             native_result(move || native::domain_add(&domain)).await
         }
+        "domain-autopilot" => {
+            let domain = body.domain.unwrap_or_default();
+            native_result(move || native::domain_autopilot(&domain)).await
+        }
         "domain-check" => {
             let domain = body.domain.unwrap_or_default();
             native_result(move || native::domain_check(&domain)).await
