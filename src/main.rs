@@ -115,7 +115,9 @@ async fn main() {
         .route("/api/logout", get(routes::logout))
         .route("/api/auth/check", get(routes::auth_check))
         .route("/api/webmail/login", post(routes::webmail_login))
-        .route("/api/webmail/logout", get(routes::webmail_logout));
+        .route("/api/webmail/logout", get(routes::webmail_logout))
+        .route("/auth/oidc/login", get(auth::oidc_login))
+        .route("/auth/oidc/callback", get(auth::oidc_callback));
 
     // Static file serving (SvelteKit build output) with SPA fallback
     let index_path = format!("{}/index.html", cfg.static_dir);

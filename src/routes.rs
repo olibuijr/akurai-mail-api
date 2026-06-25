@@ -137,27 +137,7 @@ pub async fn logout(headers: HeaderMap) -> Response {
 }
 
 pub async fn auth_check(headers: HeaderMap) -> Response {
-    let cookies = parse_cookies(&headers);
-    let cfg = config::get();
-    let admin = {
-        let val = cookies
-            .get(auth::SESSION_COOKIE)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        auth::is_authenticated(val, &cfg.admin_user, &cfg.admin_password)
-    };
-    let mailbox = {
-        let val = cookies
-            .get(auth::MAILBOX_SESSION_COOKIE)
-            .map(|s| s.as_str())
-            .unwrap_or("");
-        auth::mailbox_from_session(val, &cfg.admin_password)
-    };
-    json_ok(json!({
-        "authenticated": admin,
-        "mailbox": mailbox,
-        "user": if admin { cfg.admin_user.clone() } else { String::new() },
-    }))
+    json_ok(auth::auth_check_response(&headers))
 }
 
 // ---------------------------------------------------------------------------

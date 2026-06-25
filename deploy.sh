@@ -76,6 +76,10 @@ AKURAI_ADMIN_PASSWORD=$admin_password
 AKURAI_LISTEN=127.0.0.1:3000
 AKURAI_STATIC_DIR=/opt/akurai-mail-ui/static
 RUST_LOG=akurai_mail_api=info
+AKURAI_BASE_URL=${AKURAI_BASE_URL:-https://mail.olibuijr.com}
+AKURAI_OIDC_ISSUER=${AKURAI_OIDC_ISSUER:-https://auth.olibuijr.com}
+AKURAI_OIDC_CLIENT_ID=${AKURAI_OIDC_CLIENT_ID:-}
+AKURAI_OIDC_CLIENT_SECRET=${AKURAI_OIDC_CLIENT_SECRET:-}
 EOF
 chmod 0600 /etc/akurai-mail-ui.env
 
